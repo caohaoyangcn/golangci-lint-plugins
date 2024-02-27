@@ -13,64 +13,30 @@ import (
 	"go/types"
 )
 
-// emitAlloc emits to f a new Alloc instruction allocating a variable
-// of type typ.
+// emitNew emits to f a new (heap Alloc) instruction allocating an
+// object of type typ.  pos is the optional source location.
 //
-// The caller must set Alloc.Heap=true (for an heap-allocated variable)
-// or add the Alloc to f.Locals (for a frame-allocated variable).
-//
-// During building, a variable in f.Locals may have its Heap flag
-// set when it is discovered that its address is taken.
-// These Allocs are removed from f.Locals at the end.
-//
-// The builder should generally call one of the emit{New,Local,LocalVar} wrappers instead.
-func emitAlloc(f *Function, typ types.Type, pos token.Pos, comment string) *Alloc {
-	v := &Alloc{Comment: comment}
+func emitNew(f *Function, typ types.Type, pos token.Pos) *Alloc {
+	v := &Alloc{Heap: true}
 	v.setType(types.NewPointer(typ))
 	v.setPos(pos)
 	f.emit(v)
 	return v
 }
 
-// emitNew emits to f a new Alloc instruction heap-allocating a
-// variable of type typ. pos is the optional source location.
-func emitNew(f *Function, typ types.Type, pos token.Pos, comment string) *Alloc {
-	alloc := emitAlloc(f, typ, pos, comment)
-	alloc.Heap = true
-	return alloc
-}
-
-// emitLocal creates a local var for (t, pos, comment) and
-// emits an Alloc instruction for it.
-//
-// (Use this function or emitNew for synthetic variables;
-// for source-level variables, use emitLocalVar.)
-func emitLocal(f *Function, t types.Type, pos token.Pos, comment string) *Alloc {
-	local := emitAlloc(f, t, pos, comment)
-	f.Locals = append(f.Locals, local)
-	return local
-}
-
-// emitLocalVar creates a local var for v and emits an Alloc instruction for it.
-// Subsequent calls to f.lookup(v) return it.
-// It applies the appropriate generic instantiation to the type.
-func emitLocalVar(f *Function, v *types.Var) *Alloc {
-	alloc := emitLocal(f, f.typ(v.Type()), v.Pos(), v.Name())
-	f.vars[v] = alloc
-	return alloc
-}
-
 // emitLoad emits to f an instruction to load the address addr into a
 // new temporary, and returns the value so defined.
+//
 func emitLoad(f *Function, addr Value) *UnOp {
 	v := &UnOp{Op: token.MUL, X: addr}
-	v.setType(mustDeref(addr.Type()))
+	v.setType(deref(addr.Type()))
 	f.emit(v)
 	return v
 }
 
 // emitDebugRef emits to f a DebugRef pseudo-instruction associating
 // expression e with value v.
+//
 func emitDebugRef(f *Function, e ast.Expr, v Value, isAddr bool) {
 	if !f.debugInfo() {
 		return // debugging not enabled
@@ -84,7 +50,7 @@ func emitDebugRef(f *Function, e ast.Expr, v Value, isAddr bool) {
 		if isBlankIdent(id) {
 			return
 		}
-		obj = f.objectOf(id)
+		obj = f.Pkg.objectOf(id)
 		switch obj.(type) {
 		case *types.Nil, *types.Const, *types.Builtin:
 			return
@@ -102,21 +68,15 @@ func emitDebugRef(f *Function, e ast.Expr, v Value, isAddr bool) {
 // where op is an eager shift, logical or arithmetic operation.
 // (Use emitCompare() for comparisons and Builder.logicalBinop() for
 // non-eager operations.)
+//
 func emitArith(f *Function, op token.Token, x, y Value, t types.Type, pos token.Pos) Value {
 	switch op {
 	case token.SHL, token.SHR:
 		x = emitConv(f, x, t)
 		// y may be signed or an 'untyped' constant.
-
-		// There is a runtime panic if y is signed and <0. Instead of inserting a check for y<0
-		// and converting to an unsigned value (like the compiler) leave y as is.
-
-		if isUntyped(y.Type().Underlying()) {
-			// Untyped conversion:
-			// Spec https://go.dev/ref/spec#Operators:
-			// The right operand in a shift expression must have integer type or be an untyped constant
-			// representable by a value of type uint.
-			y = emitConv(f, y, types.Typ[types.Uint])
+		// TODO(adonovan): whence signed values?
+		if b, ok := y.Type().Underlying().(*types.Basic); ok && b.Info()&types.IsUnsigned == 0 {
+			y = emitConv(f, y, types.Typ[types.Uint64])
 		}
 
 	case token.ADD, token.SUB, token.MUL, token.QUO, token.REM, token.AND, token.OR, token.XOR, token.AND_NOT:
@@ -138,7 +98,8 @@ func emitArith(f *Function, op token.Token, x, y Value, t types.Type, pos token.
 }
 
 // emitCompare emits to f code compute the boolean result of
-// comparison 'x op y'.
+// comparison comparison 'x op y'.
+//
 func emitCompare(f *Function, op token.Token, x, y Value, pos token.Pos) Value {
 	xt := x.Type().Underlying()
 	yt := y.Type().Underlying()
@@ -158,9 +119,9 @@ func emitCompare(f *Function, op token.Token, x, y Value, pos token.Pos) Value {
 
 	if types.Identical(xt, yt) {
 		// no conversion necessary
-	} else if isNonTypeParamInterface(x.Type()) {
+	} else if _, ok := xt.(*types.Interface); ok {
 		y = emitConv(f, y, x.Type())
-	} else if isNonTypeParamInterface(y.Type()) {
+	} else if _, ok := yt.(*types.Interface); ok {
 		x = emitConv(f, x, y.Type())
 	} else if _, ok := x.(*Const); ok {
 		x = emitConv(f, x, y.Type())
@@ -183,9 +144,10 @@ func emitCompare(f *Function, op token.Token, x, y Value, pos token.Pos) Value {
 // isValuePreserving returns true if a conversion from ut_src to
 // ut_dst is value-preserving, i.e. just a change of type.
 // Precondition: neither argument is a named type.
+//
 func isValuePreserving(ut_src, ut_dst types.Type) bool {
 	// Identical underlying types?
-	if types.IdenticalIgnoreTags(ut_dst, ut_src) {
+	if structTypesIdentical(ut_dst, ut_src) {
 		return true
 	}
 
@@ -206,7 +168,8 @@ func isValuePreserving(ut_src, ut_dst types.Type) bool {
 // emitConv emits to f code to convert Value val to exactly type typ,
 // and returns the converted value.  Implicit conversions are required
 // by language assignability rules in assignments, parameter passing,
-// etc.
+// etc.  Conversions cannot fail dynamically.
+//
 func emitConv(f *Function, val Value, typ types.Type) Value {
 	t_src := val.Type()
 
@@ -214,20 +177,21 @@ func emitConv(f *Function, val Value, typ types.Type) Value {
 	if types.Identical(t_src, typ) {
 		return val
 	}
+
 	ut_dst := typ.Underlying()
 	ut_src := t_src.Underlying()
 
-	// Conversion to, or construction of a value of, an interface type?
-	if isNonTypeParamInterface(typ) {
-		// Interface name change?
-		if isValuePreserving(ut_src, ut_dst) {
-			c := &ChangeType{X: val}
-			c.setType(typ)
-			return f.emit(c)
-		}
+	// Just a change of type, but not value or representation?
+	if isValuePreserving(ut_src, ut_dst) {
+		c := &ChangeType{X: val}
+		c.setType(typ)
+		return f.emit(c)
+	}
 
+	// Conversion to, or construction of a value of, an interface type?
+	if _, ok := ut_dst.(*types.Interface); ok {
 		// Assignment from one interface type to another?
-		if isNonTypeParamInterface(t_src) {
+		if _, ok := ut_src.(*types.Interface); ok {
 			c := &ChangeInterface{X: val}
 			c.setType(typ)
 			return f.emit(c)
@@ -235,7 +199,7 @@ func emitConv(f *Function, val Value, typ types.Type) Value {
 
 		// Untyped nil constant?  Return interface-typed nil constant.
 		if ut_src == tUntypedNil {
-			return zeroConst(typ)
+			return nilConst(typ)
 		}
 
 		// Convert (non-nil) "untyped" literals to their default type.
@@ -243,95 +207,15 @@ func emitConv(f *Function, val Value, typ types.Type) Value {
 			val = emitConv(f, val, types.Default(ut_src))
 		}
 
-		// Record the types of operands to MakeInterface, if
-		// non-parameterized, as they are the set of runtime types.
-		t := val.Type()
-		if f.typeparams.Len() == 0 || !f.Prog.parameterized.isParameterized(t) {
-			addRuntimeType(f.Prog, t)
-		}
-
+		f.Pkg.Prog.needMethodsOf(val.Type())
 		mi := &MakeInterface{X: val}
 		mi.setType(typ)
 		return f.emit(mi)
 	}
 
-	// In the common case, the typesets of src and dst are singletons
-	// and we emit an appropriate conversion. But if either contains
-	// a type parameter, the conversion may represent a cross product,
-	// in which case which we emit a MultiConvert.
-	dst_terms := typeSetOf(ut_dst)
-	src_terms := typeSetOf(ut_src)
-
-	// conversionCase describes an instruction pattern that maybe emitted to
-	// model d <- s for d in dst_terms and s in src_terms.
-	// Multiple conversions can match the same pattern.
-	type conversionCase uint8
-	const (
-		changeType conversionCase = 1 << iota
-		sliceToArray
-		sliceToArrayPtr
-		sliceTo0Array
-		sliceTo0ArrayPtr
-		convert
-	)
-	classify := func(s, d types.Type) conversionCase {
-		// Just a change of type, but not value or representation?
-		if isValuePreserving(s, d) {
-			return changeType
-		}
-
-		// Conversion from slice to array or slice to array pointer?
-		if slice, ok := s.(*types.Slice); ok {
-			var arr *types.Array
-			var ptr bool
-			// Conversion from slice to array pointer?
-			switch d := d.(type) {
-			case *types.Array:
-				arr = d
-			case *types.Pointer:
-				arr, _ = d.Elem().Underlying().(*types.Array)
-				ptr = true
-			}
-			if arr != nil && types.Identical(slice.Elem(), arr.Elem()) {
-				if arr.Len() == 0 {
-					if ptr {
-						return sliceTo0ArrayPtr
-					} else {
-						return sliceTo0Array
-					}
-				}
-				if ptr {
-					return sliceToArrayPtr
-				} else {
-					return sliceToArray
-				}
-			}
-		}
-
-		// The only remaining case in well-typed code is a representation-
-		// changing conversion of basic types (possibly with []byte/[]rune).
-		if !isBasic(s) && !isBasic(d) {
-			panic(fmt.Sprintf("in %s: cannot convert term %s (%s [within %s]) to type %s [within %s]", f, val, val.Type(), s, typ, d))
-		}
-		return convert
-	}
-
-	var classifications conversionCase
-	for _, s := range src_terms {
-		us := s.Type().Underlying()
-		for _, d := range dst_terms {
-			ud := d.Type().Underlying()
-			classifications |= classify(us, ud)
-		}
-	}
-	if classifications == 0 {
-		panic(fmt.Sprintf("in %s: cannot convert %s (%s) to %s", f, val, val.Type(), typ))
-	}
-
 	// Conversion of a compile-time constant value?
 	if c, ok := val.(*Const); ok {
-		// Conversion to a basic type?
-		if isBasic(ut_dst) {
+		if _, ok := ut_dst.(*types.Basic); ok || c.IsNil() {
 			// Conversion of a compile-time constant to
 			// another constant type results in a new
 			// constant of the destination type and
@@ -339,85 +223,32 @@ func emitConv(f *Function, val Value, typ types.Type) Value {
 			// We don't truncate the value yet.
 			return NewConst(c.Value, typ)
 		}
-		// Can we always convert from zero value without panicking?
-		const mayPanic = sliceToArray | sliceToArrayPtr
-		if c.Value == nil && classifications&mayPanic == 0 {
-			return NewConst(nil, typ)
-		}
 
 		// We're converting from constant to non-constant type,
 		// e.g. string -> []byte/[]rune.
 	}
 
-	switch classifications {
-	case changeType: // representation-preserving change
-		c := &ChangeType{X: val}
-		c.setType(typ)
-		return f.emit(c)
-
-	case sliceToArrayPtr, sliceTo0ArrayPtr: // slice to array pointer
-		c := &SliceToArrayPointer{X: val}
-		c.setType(typ)
-		return f.emit(c)
-
-	case sliceToArray: // slice to arrays (not zero-length)
-		ptype := types.NewPointer(typ)
-		p := &SliceToArrayPointer{X: val}
-		p.setType(ptype)
-		x := f.emit(p)
-		unOp := &UnOp{Op: token.MUL, X: x}
-		unOp.setType(typ)
-		return f.emit(unOp)
-
-	case sliceTo0Array: // slice to zero-length arrays (constant)
-		return zeroConst(typ)
-
-	case convert: // representation-changing conversion
+	// A representation-changing conversion?
+	// At least one of {ut_src,ut_dst} must be *Basic.
+	// (The other may be []byte or []rune.)
+	_, ok1 := ut_src.(*types.Basic)
+	_, ok2 := ut_dst.(*types.Basic)
+	if ok1 || ok2 {
 		c := &Convert{X: val}
 		c.setType(typ)
 		return f.emit(c)
+	}
 
-	default: // multiple conversion
-		c := &MultiConvert{X: val, from: src_terms, to: dst_terms}
-		c.setType(typ)
-		return f.emit(c)
-	}
-}
-
-// emitTypeCoercion emits to f code to coerce the type of a
-// Value v to exactly type typ, and returns the coerced value.
-//
-// Requires that coercing v.Typ() to typ is a value preserving change.
-//
-// Currently used only when v.Type() is a type instance of typ or vice versa.
-// A type v is a type instance of a type t if there exists a
-// type parameter substitution σ s.t. σ(v) == t. Example:
-//
-//	σ(func(T) T) == func(int) int for σ == [T ↦ int]
-//
-// This happens in instantiation wrappers for conversion
-// from an instantiation to a parameterized type (and vice versa)
-// with σ substituting f.typeparams by f.typeargs.
-func emitTypeCoercion(f *Function, v Value, typ types.Type) Value {
-	if types.Identical(v.Type(), typ) {
-		return v // no coercion needed
-	}
-	// TODO(taking): for instances should we record which side is the instance?
-	c := &ChangeType{
-		X: v,
-	}
-	c.setType(typ)
-	f.emit(c)
-	return c
+	panic(fmt.Sprintf("in %s: cannot convert %s (%s) to %s", f, val, val.Type(), typ))
 }
 
 // emitStore emits to f an instruction to store value val at location
 // addr, applying implicit conversions as required by assignability rules.
+//
 func emitStore(f *Function, addr, val Value, pos token.Pos) *Store {
-	typ := mustDeref(addr.Type())
 	s := &Store{
 		Addr: addr,
-		Val:  emitConv(f, val, typ),
+		Val:  emitConv(f, val, deref(addr.Type())),
 		pos:  pos,
 	}
 	f.emit(s)
@@ -426,6 +257,7 @@ func emitStore(f *Function, addr, val Value, pos token.Pos) *Store {
 
 // emitJump emits to f a jump to target, and updates the control-flow graph.
 // Postcondition: f.currentBlock is nil.
+//
 func emitJump(f *Function, target *BasicBlock) {
 	b := f.currentBlock
 	b.emit(new(Jump))
@@ -436,6 +268,7 @@ func emitJump(f *Function, target *BasicBlock) {
 // emitIf emits to f a conditional jump to tblock or fblock based on
 // cond, and updates the control-flow graph.
 // Postcondition: f.currentBlock is nil.
+//
 func emitIf(f *Function, cond Value, tblock, fblock *BasicBlock) {
 	b := f.currentBlock
 	b.emit(&If{Cond: cond})
@@ -446,6 +279,7 @@ func emitIf(f *Function, cond Value, tblock, fblock *BasicBlock) {
 
 // emitExtract emits to f an instruction to extract the index'th
 // component of tuple.  It returns the extracted value.
+//
 func emitExtract(f *Function, tuple Value, index int) Value {
 	e := &Extract{Tuple: tuple, Index: index}
 	e.setType(tuple.Type().(*types.Tuple).At(index).Type())
@@ -454,6 +288,7 @@ func emitExtract(f *Function, tuple Value, index int) Value {
 
 // emitTypeAssert emits to f a type assertion value := x.(t) and
 // returns the value.  x.Type() must be an interface.
+//
 func emitTypeAssert(f *Function, x Value, t types.Type, pos token.Pos) Value {
 	a := &TypeAssert{X: x, AssertedType: t}
 	a.setPos(pos)
@@ -463,6 +298,7 @@ func emitTypeAssert(f *Function, x Value, t types.Type, pos token.Pos) Value {
 
 // emitTypeTest emits to f a type test value,ok := x.(t) and returns
 // a (value, ok) tuple.  x.Type() must be an interface.
+//
 func emitTypeTest(f *Function, x Value, t types.Type, pos token.Pos) Value {
 	a := &TypeAssert{
 		X:            x,
@@ -482,6 +318,7 @@ func emitTypeTest(f *Function, x Value, t types.Type, pos token.Pos) Value {
 // Intended for wrapper methods.
 // Precondition: f does/will not use deferred procedure calls.
 // Postcondition: f.currentBlock is nil.
+//
 func emitTailCall(f *Function, call *Call) {
 	tresults := f.Signature.Results()
 	nr := tresults.Len()
@@ -518,28 +355,27 @@ func emitTailCall(f *Function, call *Call) {
 // If v is the address of a struct, the result will be the address of
 // a field; if it is the value of a struct, the result will be the
 // value of a field.
-func emitImplicitSelections(f *Function, v Value, indices []int, pos token.Pos) Value {
+//
+func emitImplicitSelections(f *Function, v Value, indices []int) Value {
 	for _, index := range indices {
-		if st, vptr := deref(v.Type()); vptr {
-			fld := fieldOf(st, index)
+		fld := deref(v.Type()).Underlying().(*types.Struct).Field(index)
+
+		if isPointer(v.Type()) {
 			instr := &FieldAddr{
 				X:     v,
 				Field: index,
 			}
-			instr.setPos(pos)
 			instr.setType(types.NewPointer(fld.Type()))
 			v = f.emit(instr)
 			// Load the field's value iff indirectly embedded.
-			if _, fldptr := deref(fld.Type()); fldptr {
+			if isPointer(fld.Type()) {
 				v = emitLoad(f, v)
 			}
 		} else {
-			fld := fieldOf(v.Type(), index)
 			instr := &Field{
 				X:     v,
 				Field: index,
 			}
-			instr.setPos(pos)
 			instr.setType(fld.Type())
 			v = f.emit(instr)
 		}
@@ -553,9 +389,10 @@ func emitImplicitSelections(f *Function, v Value, indices []int, pos token.Pos) 
 // will be the field's address; otherwise the result will be the
 // field's value.
 // Ident id is used for position and debug info.
+//
 func emitFieldSelection(f *Function, v Value, index int, wantAddr bool, id *ast.Ident) Value {
-	if st, vptr := deref(v.Type()); vptr {
-		fld := fieldOf(st, index)
+	fld := deref(v.Type()).Underlying().(*types.Struct).Field(index)
+	if isPointer(v.Type()) {
 		instr := &FieldAddr{
 			X:     v,
 			Field: index,
@@ -568,7 +405,6 @@ func emitFieldSelection(f *Function, v Value, index int, wantAddr bool, id *ast.
 			v = emitLoad(f, v)
 		}
 	} else {
-		fld := fieldOf(v.Type(), index)
 		instr := &Field{
 			X:     v,
 			Field: index,
@@ -581,6 +417,18 @@ func emitFieldSelection(f *Function, v Value, index int, wantAddr bool, id *ast.
 	return v
 }
 
+// zeroValue emits to f code to produce a zero value of type t,
+// and returns it.
+//
+func zeroValue(f *Function, t types.Type) Value {
+	switch t.Underlying().(type) {
+	case *types.Struct, *types.Array:
+		return emitLoad(f, f.addLocal(t, token.NoPos))
+	default:
+		return zeroConst(t)
+	}
+}
+
 // createRecoverBlock emits to f a block of code to return after a
 // recovered panic, and sets f.Recover to it.
 //
@@ -589,6 +437,7 @@ func emitFieldSelection(f *Function, v Value, index int, wantAddr bool, id *ast.
 // type.
 //
 // Idempotent.
+//
 func createRecoverBlock(f *Function) {
 	if f.Recover != nil {
 		return // already created
@@ -610,7 +459,7 @@ func createRecoverBlock(f *Function) {
 			T := R.At(i).Type()
 
 			// Return zero value of each result type.
-			results = append(results, zeroConst(T))
+			results = append(results, zeroValue(f, T))
 		}
 	}
 	f.emit(&Return{Results: results})

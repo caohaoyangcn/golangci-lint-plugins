@@ -14,7 +14,6 @@ import (
 	"io"
 	"reflect"
 	"sort"
-	"strings"
 
 	"golang.org/x/tools/go/types/typeutil"
 )
@@ -24,10 +23,11 @@ import (
 // Functions (including methods) and Globals use RelString and
 // all types are displayed with relType, so that only cross-package
 // references are package-qualified.
+//
 func relName(v Value, i Instruction) string {
 	var from *types.Package
 	if i != nil {
-		from = i.Parent().relPkg()
+		from = i.Parent().pkg()
 	}
 	switch v := v.(type) {
 	case Member: // *Function or *Global
@@ -38,24 +38,8 @@ func relName(v Value, i Instruction) string {
 	return v.Name()
 }
 
-// normalizeAnyFortesting controls whether we replace occurrences of
-// interface{} with any. It is only used for normalizing test output.
-var normalizeAnyForTesting bool
-
 func relType(t types.Type, from *types.Package) string {
-	s := types.TypeString(t, types.RelativeTo(from))
-	if normalizeAnyForTesting {
-		s = strings.ReplaceAll(s, "interface{}", "any")
-	}
-	return s
-}
-
-func relTerm(term *types.Term, from *types.Package) string {
-	s := relType(term.Type(), from)
-	if term.Tilde() {
-		return "~" + s
-	}
-	return s
+	return types.TypeString(t, types.RelativeTo(from))
 }
 
 func relString(m Member, from *types.Package) string {
@@ -73,12 +57,12 @@ func relString(m Member, from *types.Package) string {
 // It never appears in disassembly, which uses Value.Name().
 
 func (v *Parameter) String() string {
-	from := v.Parent().relPkg()
+	from := v.Parent().pkg()
 	return fmt.Sprintf("parameter %s : %s", v.Name(), relType(v.Type(), from))
 }
 
 func (v *FreeVar) String() string {
-	from := v.Parent().relPkg()
+	from := v.Parent().pkg()
 	return fmt.Sprintf("freevar %s : %s", v.Name(), relType(v.Type(), from))
 }
 
@@ -93,8 +77,8 @@ func (v *Alloc) String() string {
 	if v.Heap {
 		op = "new"
 	}
-	from := v.Parent().relPkg()
-	return fmt.Sprintf("%s %s (%s)", op, relType(mustDeref(v.Type()), from), v.Comment)
+	from := v.Parent().pkg()
+	return fmt.Sprintf("%s %s (%s)", op, relType(deref(v.Type()), from), v.Comment)
 }
 
 func (v *Phi) String() string {
@@ -167,7 +151,7 @@ func (v *UnOp) String() string {
 }
 
 func printConv(prefix string, v, x Value) string {
-	from := v.Parent().relPkg()
+	from := v.Parent().pkg()
 	return fmt.Sprintf("%s %s <- %s (%s)",
 		prefix,
 		relType(v.Type(), from),
@@ -175,29 +159,10 @@ func printConv(prefix string, v, x Value) string {
 		relName(x, v.(Instruction)))
 }
 
-func (v *ChangeType) String() string          { return printConv("changetype", v, v.X) }
-func (v *Convert) String() string             { return printConv("convert", v, v.X) }
-func (v *ChangeInterface) String() string     { return printConv("change interface", v, v.X) }
-func (v *SliceToArrayPointer) String() string { return printConv("slice to array pointer", v, v.X) }
-func (v *MakeInterface) String() string       { return printConv("make", v, v.X) }
-
-func (v *MultiConvert) String() string {
-	from := v.Parent().relPkg()
-
-	var b strings.Builder
-	b.WriteString(printConv("multiconvert", v, v.X))
-	b.WriteString(" [")
-	for i, s := range v.from {
-		for j, d := range v.to {
-			if i != 0 || j != 0 {
-				b.WriteString(" | ")
-			}
-			fmt.Fprintf(&b, "%s <- %s", relTerm(d, from), relTerm(s, from))
-		}
-	}
-	b.WriteString("]")
-	return b.String()
-}
+func (v *ChangeType) String() string      { return printConv("changetype", v, v.X) }
+func (v *Convert) String() string         { return printConv("convert", v, v.X) }
+func (v *ChangeInterface) String() string { return printConv("change interface", v, v.X) }
+func (v *MakeInterface) String() string   { return printConv("make", v, v.X) }
 
 func (v *MakeClosure) String() string {
 	var b bytes.Buffer
@@ -216,7 +181,7 @@ func (v *MakeClosure) String() string {
 }
 
 func (v *MakeSlice) String() string {
-	from := v.Parent().relPkg()
+	from := v.Parent().pkg()
 	return fmt.Sprintf("make %s %s %s",
 		relType(v.Type(), from),
 		relName(v.Len, v),
@@ -248,29 +213,31 @@ func (v *MakeMap) String() string {
 	if v.Reserve != nil {
 		res = relName(v.Reserve, v)
 	}
-	from := v.Parent().relPkg()
+	from := v.Parent().pkg()
 	return fmt.Sprintf("make %s %s", relType(v.Type(), from), res)
 }
 
 func (v *MakeChan) String() string {
-	from := v.Parent().relPkg()
+	from := v.Parent().pkg()
 	return fmt.Sprintf("make %s %s", relType(v.Type(), from), relName(v.Size, v))
 }
 
 func (v *FieldAddr) String() string {
+	st := deref(v.X.Type()).Underlying().(*types.Struct)
 	// Be robust against a bad index.
 	name := "?"
-	if fld := fieldOf(mustDeref(v.X.Type()), v.Field); fld != nil {
-		name = fld.Name()
+	if 0 <= v.Field && v.Field < st.NumFields() {
+		name = st.Field(v.Field).Name()
 	}
 	return fmt.Sprintf("&%s.%s [#%d]", relName(v.X, v), name, v.Field)
 }
 
 func (v *Field) String() string {
+	st := v.X.Type().Underlying().(*types.Struct)
 	// Be robust against a bad index.
 	name := "?"
-	if fld := fieldOf(v.X.Type(), v.Field); fld != nil {
-		name = fld.Name()
+	if 0 <= v.Field && v.Field < st.NumFields() {
+		name = st.Field(v.Field).Name()
 	}
 	return fmt.Sprintf("%s.%s [#%d]", relName(v.X, v), name, v.Field)
 }
@@ -296,7 +263,7 @@ func (v *Next) String() string {
 }
 
 func (v *TypeAssert) String() string {
-	from := v.Parent().relPkg()
+	from := v.Parent().pkg()
 	return fmt.Sprintf("typeassert%s %s.(%s)", commaOk(v.CommaOk), relName(v.X, v), relType(v.AssertedType, from))
 }
 
@@ -449,7 +416,7 @@ func WritePackage(buf *bytes.Buffer, p *Package) {
 
 		case *Global:
 			fmt.Fprintf(buf, "  var   %-*s %s\n",
-				maxname, name, relType(mustDeref(mem.Type()), from))
+				maxname, name, relType(mem.Type().(*types.Pointer).Elem(), from))
 		}
 	}
 

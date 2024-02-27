@@ -29,10 +29,12 @@ import (
 // its parent in the dominator tree, if any.
 // Neither the entry node (b.Index==0) nor recover node
 // (b==b.Parent().Recover()) have a parent.
+//
 func (b *BasicBlock) Idom() *BasicBlock { return b.dom.idom }
 
 // Dominees returns the list of blocks that b immediately dominates:
 // its children in the dominator tree.
+//
 func (b *BasicBlock) Dominees() []*BasicBlock { return b.dom.children }
 
 // Dominates reports whether b dominates c.
@@ -40,25 +42,21 @@ func (b *BasicBlock) Dominates(c *BasicBlock) bool {
 	return b.dom.pre <= c.dom.pre && c.dom.post <= b.dom.post
 }
 
-// DomPreorder returns a new slice containing the blocks of f
-// in a preorder traversal of the dominator tree.
-func (f *Function) DomPreorder() []*BasicBlock {
-	slice := append([]*BasicBlock(nil), f.Blocks...)
-	sort.Slice(slice, func(i, j int) bool {
-		return slice[i].dom.pre < slice[j].dom.pre
-	})
-	return slice
-}
+type byDomPreorder []*BasicBlock
 
-// DomPostorder returns a new slice containing the blocks of f
-// in a postorder traversal of the dominator tree.
-// (This is not the same as a postdominance order.)
-func (f *Function) DomPostorder() []*BasicBlock {
-	slice := append([]*BasicBlock(nil), f.Blocks...)
-	sort.Slice(slice, func(i, j int) bool {
-		return slice[i].dom.post < slice[j].dom.post
-	})
-	return slice
+func (a byDomPreorder) Len() int           { return len(a) }
+func (a byDomPreorder) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byDomPreorder) Less(i, j int) bool { return a[i].dom.pre < a[j].dom.pre }
+
+// DomPreorder returns a new slice containing the blocks of f in
+// dominator tree preorder.
+//
+func (f *Function) DomPreorder() []*BasicBlock {
+	n := len(f.Blocks)
+	order := make(byDomPreorder, n)
+	copy(order, f.Blocks)
+	sort.Sort(order)
+	return order
 }
 
 // domInfo contains a BasicBlock's dominance information.
@@ -112,6 +110,7 @@ func (lt *ltState) link(v, w *BasicBlock) {
 
 // buildDomTree computes the dominator tree of f using the LT algorithm.
 // Precondition: all blocks are reachable (e.g. optimizeBlocks has been run).
+//
 func buildDomTree(f *Function) {
 	// The step numbers refer to the original LT paper; the
 	// reordering is due to Georgiadis.
@@ -211,6 +210,7 @@ func buildDomTree(f *Function) {
 // numberDomTree sets the pre- and post-order numbers of a depth-first
 // traversal of the dominator tree rooted at v.  These are used to
 // answer dominance queries in constant time.
+//
 func numberDomTree(v *BasicBlock, pre, post int32) (int32, int32) {
 	v.dom.pre = pre
 	pre++
@@ -228,6 +228,7 @@ func numberDomTree(v *BasicBlock, pre, post int32) (int32, int32) {
 // computed by the LT algorithm by comparing against the dominance
 // relation computed by a naive Kildall-style forward dataflow
 // analysis (Algorithm 10.16 from the "Dragon" book).
+//
 func sanityCheckDomTree(f *Function) {
 	n := len(f.Blocks)
 
@@ -308,7 +309,7 @@ func sanityCheckDomTree(f *Function) {
 
 // Printing functions ----------------------------------------
 
-// printDomTreeText prints the dominator tree as text, using indentation.
+// printDomTree prints the dominator tree as text, using indentation.
 func printDomTreeText(buf *bytes.Buffer, v *BasicBlock, indent int) {
 	fmt.Fprintf(buf, "%*s%s\n", 4*indent, "", v)
 	for _, child := range v.dom.children {
