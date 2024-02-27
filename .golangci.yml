@@ -2,4 +2,4 @@ linters-settings:
 
   custom:
     sqltransactioncheck:
-      path: ./main.so
+      path: ./golangci-lint-plugins/main.so
