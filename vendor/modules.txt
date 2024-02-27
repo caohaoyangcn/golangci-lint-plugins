@@ -1,0 +1,10 @@
+# golang.org/x/tools v0.18.0
+## explicit; go 1.18
+golang.org/x/tools/go/analysis
+golang.org/x/tools/go/analysis/passes/buildssa
+golang.org/x/tools/go/ast/astutil
+golang.org/x/tools/go/ssa
+golang.org/x/tools/go/types/typeutil
+golang.org/x/tools/internal/aliases
+golang.org/x/tools/internal/typeparams
+golang.org/x/tools/internal/versions
